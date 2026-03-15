@@ -1,0 +1,258 @@
+================================================================================
+FOODY — BACKEND ARCHITECTURE v1
+================================================================================
+
+--------------------------------------------------------------------------------
+0. SCALE ANALYSIS (drives every decision below)
+--------------------------------------------------------------------------------
+  Orders/day ............... ~2,000
+  Peak-hour orders ......... ~250–300 (lunch/dinner rushes, ~3x avg)
+  Peak requests/sec ........ ~5–10 rps (including tracking pings)
+  Concurrent moving units .. 95 riders max
+  Spatial domain ........... 2,000 x 2,000 m grid (4M cells, 80 sellers)
+
+  VERDICT: This is a SMALL system. One beefy server handles this with
+  headroom to 10x. The architecture must optimize for CORRECTNESS of
+  dispatch and SIMPLICITY of operation — not for horizontal scale.
+
+  Anti-goal: microservices, Kafka, Kubernetes, service meshes. All of
+  that would be pure operational drag at this scale.
+
+--------------------------------------------------------------------------------
+1. ARCHITECTURAL STYLE: MODULAR MONOLITH
+--------------------------------------------------------------------------------
+  A single deployable process, internally split into strongly-bounded
+  modules that talk through explicit in-process interfaces (function
+  calls / internal event bus), never by reaching into each other's
+  tables.
+
+  Why monolith:
+    - 5–10 rps does not justify network hops between services.
+    - A single ACID transaction can span "charge card + create order +
+      reserve rider" — no sagas, no eventual-consistency bugs.
+    - One repo, one deploy, one log stream. A 2-person team can run it.
+
+  Why MODULAR:
+    - Dispatch logic is genuinely complex and must be testable in
+      isolation.
+    - If one module (e.g. dispatch) ever needs to be extracted into its
+      own service, the seam already exists.
+
+--------------------------------------------------------------------------------
+2. MODULE MAP
+--------------------------------------------------------------------------------
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │                       API GATEWAY LAYER                            │
+  │   REST/JSON for CRUD      •      WebSocket for live tracking       │
+  └───────┬───────────────────────────────────────────────┬────────────┘
+          │                                               │
+  ┌───────▼────────┐  ┌──────────────┐  ┌────────────┐  ┌─▼──────────┐
+  │   ACCOUNTS     │  │   CATALOG    │  │  ORDERING  │  │  TRACKING  │
+  │ clients,       │  │ sellers,     │  │ cart, order│  │ rider GPS  │
+  │ riders, auth   │  │ menus, hours │  │ lifecycle  │  │ ingest +   │
+  └────────────────┘  └──────────────┘  └─────┬──────┘  │ fan-out    │
+                                              │         └─────┬──────┘
+                            ┌─────────────────▼──────┐        │
+                            │       DISPATCH         │◄───────┘
+                            │  rider assignment +    │
+                            │  ETA engine (the core) │
+                            └─────────────┬──────────┘
+                                          │
+  ┌──────────────┐  ┌──────────────┐  ┌───▼──────────┐
+  │   PAYMENTS   │  │ NOTIFICATIONS│  │     GEO      │
+  │  (adapter to │  │ push / SMS   │  │ spatial index│
+  │  ext. PSP)   │  │  (adapter)   │  │ & distance   │
+  └──────────────┘  └──────────────┘  └──────────────┘
+
+  Module boundaries are enforced by:
+    - Each module owns its DB tables. No cross-module JOINs.
+    - Modules expose a service interface (plain class/functions).
+    - Cross-cutting events go through an in-process event bus
+      (synchronous dispatch, just a list of subscribers — not a broker).
+
+--------------------------------------------------------------------------------
+3. THE GEO MODULE — SPATIAL MODEL
+--------------------------------------------------------------------------------
+  The 2000x2000 grid is a MENTAL MODEL, not a storage model. We do NOT
+  allocate a 4-million-cell matrix. We store points and index them.
+
+  Coordinate system:
+    - Internal unit: integer meters, origin at SW corner.
+      Position = (x: 0..1999, y: 0..1999).
+    - Integer math avoids float drift and makes positions hashable.
+
+  Spatial index (two-tier):
+
+    TIER 1 — Coarse grid buckets (in memory)
+      Bucket size: 250 m  →  8 x 8 = 64 buckets total.
+      Each bucket holds: set<rider_id>, set<seller_id>.
+      Rider moves → O(1) bucket reassignment.
+      "Riders near seller X" → check seller's bucket + 8 neighbours
+      = at most 9 lookups, typically returns 10–15 riders.
+      With only 95 riders this is overkill, but it keeps dispatch
+      queries O(1) regardless of fleet growth.
+
+    TIER 2 — Exact distance (on the shortlist)
+      Manhattan distance as default metric:
+        d = |x1-x2| + |y1-y2|
+      Rationale: dense urban grid → riders travel along streets, not
+      diagonals. Manhattan is a better real-world proxy than Euclidean
+      and is cheaper to compute.
+      travel_time = d / (18_000 m / 60 min) = d / 300  [minutes]
+
+    Seller positions are static → precomputed once at boot, bucketed,
+    and cached. Rider positions are hot → held in an in-memory struct
+    refreshed by the Tracking module.
+
+--------------------------------------------------------------------------------
+4. THE DISPATCH MODULE — THE ACTUAL HARD PART
+--------------------------------------------------------------------------------
+  Everything else is CRUD. This is where the business lives.
+
+  4.1 Time-budget model
+      max_client_wait     45 min   (hard ceiling)
+      − avg_food_prep     15 min
+      − avg_pickup_wait    4 min
+      ─────────────────────────────
+      travel budget       26 min  →  ~7.8 km at 18 km/h
+      Worst-case trip in a 2x2 km square (Manhattan): 4 km ≈ 13 min.
+      CONCLUSION: geometry is never the bottleneck. The bottleneck is
+      RIDER AVAILABILITY during peak. Dispatch must optimize for
+      throughput, not for shortest path.
+
+  4.2 Assignment strategy — deferred greedy
+      Do NOT assign a rider the instant an order is placed.
+      Instead:
+        t=0     Order placed → state=PREPARING. No rider yet.
+        t=0     Compute latest_dispatch_time =
+                  prep_time − (rider_travel_to_seller) − safety_margin
+        t=~10m  Dispatch tick assigns the nearest IDLE rider whose
+                ETA to seller ≈ remaining prep time.
+      Why: a rider assigned at t=0 sits idle at the seller for 15 min.
+      Deferred assignment lets that rider complete another short
+      delivery first. At 2k orders/day with 95 riders this is the
+      difference between "comfortable" and "queue backs up at 12:30".
+
+  4.3 Scoring function (per candidate rider)
+        score = w1 * travel_time_to_seller
+              + w2 * |arrival_time − food_ready_time|   (sync penalty)
+              + w3 * rider_consecutive_deliveries       (fairness)
+              − w4 * rider_is_already_heading_that_way  (chaining bonus)
+      Lowest score wins. Weights are config, tunable without redeploy.
+
+  4.4 Dispatcher loop
+      Single goroutine/thread. Ticks every 2 seconds.
+      Per tick:
+        - Pull orders in state=AWAITING_RIDER where
+          now >= latest_dispatch_time − lookhead_window.
+        - For each, query Geo for candidate riders, score, assign.
+        - Assignment = atomic DB transaction:
+            rider.state → EN_ROUTE_TO_SELLER
+            order.state → RIDER_ASSIGNED
+            emit OrderAssigned event
+      Single-threaded by design: no lock contention, no double-assign
+      races, trivial to reason about. 300 peak-hour orders / 1800 ticks
+      per hour = ~0.17 assignments per tick. Laughably cheap.
+
+  4.5 Failure / reassignment
+      Rider rejects or goes offline → order back to AWAITING_RIDER
+      with elevated priority. After 2 failed assignments, page a human.
+
+--------------------------------------------------------------------------------
+5. ORDER STATE MACHINE
+--------------------------------------------------------------------------------
+  Canonical, append-only. Every transition is an event row.
+
+    CART ──submit──► PLACED ──seller_ack──► PREPARING
+                                               │
+                           ┌───────────────────┤
+                           ▼                   ▼
+                     AWAITING_RIDER ──► RIDER_ASSIGNED
+                                               │
+                        RIDER_AT_SELLER ◄──────┘
+                           │
+                        PICKED_UP ──► DELIVERED ──► SETTLED
+
+    Any state ──► CANCELLED  (with reason + compensating actions)
+
+  Stored as: orders(current_state) + order_events(append-only log).
+  The event log is the source of truth; current_state is a projection
+  for fast queries. This gives you free audit trail + free analytics.
+
+--------------------------------------------------------------------------------
+6. TRACKING MODULE — REAL-TIME POSITIONS
+--------------------------------------------------------------------------------
+  Ingest:
+    Rider app POSTs {rider_id, x, y, heading, ts} every 5 seconds.
+    95 riders × 0.2 Hz = 19 writes/sec. Trivial.
+    Writes go to an in-memory map (hot) + async batch-flush to a
+    rider_positions table every 30s (warm, for analytics).
+
+  Fan-out:
+    Client opens WebSocket on order detail screen.
+    Server pushes rider position for THAT order every 5s.
+    Peak concurrent watchers ≈ active orders ≈ ~100. One process
+    handles this without breaking a sweat.
+
+  The in-memory rider map IS the Geo module's Tier-1 index. Same
+  struct, two readers (Tracking fan-out + Dispatch queries).
+
+--------------------------------------------------------------------------------
+7. PERSISTENCE
+--------------------------------------------------------------------------------
+  PostgreSQL. One instance. Done.
+
+    - ACID for money and order state.
+    - PostGIS available if Manhattan-on-a-grid ever proves too naive
+      (it won't at 2 km²).
+    - JSONB columns for menu items → sellers change menus without
+      schema migrations.
+    - order_events table partitioned by month → cheap to archive.
+
+  No Redis needed yet. The "cache" is a process-local struct holding
+  95 rider positions and 80 seller positions — ~20 KB. If you ever
+  run >1 app instance, THAT is the moment to add Redis for shared
+  rider state. Not before.
+
+  No message queue needed. The in-process event bus is synchronous.
+  Notifications to external systems (push, SMS, PSP webhooks) go
+  through a tiny outbox table polled by a background worker — this
+  gives at-least-once delivery without running RabbitMQ.
+
+--------------------------------------------------------------------------------
+8. PROCESS TOPOLOGY
+--------------------------------------------------------------------------------
+  ONE binary, THREE logical workers inside it:
+
+    [ HTTP/WS server ]   — handles all client/seller/rider API calls
+    [ Dispatcher     ]   — the 2-second tick loop (section 4.4)
+    [ Outbox worker  ]   — drains outbox table → external services
+
+  Deploy as a single container. Run two replicas behind a load
+  balancer for availability (not for scale). Dispatcher uses a
+  Postgres advisory lock so only one replica's dispatcher is active;
+  the other is a hot standby.
+
+--------------------------------------------------------------------------------
+9. WHAT WE DELIBERATELY DID NOT BUILD
+--------------------------------------------------------------------------------
+  ✗ Microservices        — 10 rps doesn't need 10 repos.
+  ✗ Kafka / event stream — outbox table does the job at this volume.
+  ✗ Redis                — 95 riders fit in a Python dict.
+  ✗ GraphQL              — three client types, stable contracts. REST.
+  ✗ Real routing engine  — Manhattan on a 2 km grid is within 10% of
+                           truth. Revisit if you expand beyond the zone.
+  ✗ ML dispatch          — greedy + good scoring beats a bad model.
+                           Collect the event log now; train later.
+
+--------------------------------------------------------------------------------
+10. FIRST EXTENSION SEAMS (when you outgrow this)
+--------------------------------------------------------------------------------
+  - Multi-zone: Geo module gains a zone_id dimension; one dispatcher
+    loop per zone. Still one binary.
+  - >500 riders: swap the 8x8 bucket grid for an R-tree or PostGIS
+    GiST index. Interface stays the same.
+  - >50k orders/day: extract Dispatch into its own service. The
+    module boundary is already the service boundary.
+================================================================================
